@@ -1,0 +1,48 @@
+Hello, I am working on a game that uses VEX robots to play football. I need help integrating the arena. There are 2 goals (Home and Away). Each goal uses a HC-SR04 on the side of the "net" to detect if a small ball has gone in. There is 150mm between the sensor and the other side of the goal. The distance read by the sensor when the ball has not gone in should be around 150mm. If it is less (than a certain threshold), that means the ball has gone in and a goal has been scored. Hardware wise, I am using two HC-SR04 ultrasonic sensors, a DEV Module ESP32 to control everyting and a 2.8" TFT LCD Screen for the scoreboard. I want it to display the Score for example "Home 4 : Away 2" to keep track of goals. Also when a goal is scored I want that to show up (maybe flash on the LCD screen). I want home team to be in green writing and away team to be in blue writing; Althought I want to be able to define the colours at the start of the code. I also want a running clock that will stop the match after a certain number of minutes (in football, this would be two halves consisiting of 45mins each but i want these to be shorter. Just before the game is about to start, I want the timer and the game to start when a push button has been pressed. From this moment, it will only stop at "half time" after which, when the button is pressed again the second half will resume. When the game ends after the second half finishes, the button may be pressed again to reset the game from the start. I will also want the teams to witch sides after halftime, so they should be reminded to do so on the TFT screen after halftime, the scores whould still reflect each team's score so it should take the side change into account. The scoreboard is in the middle of the field with the "Home Team" set of goals on the left and "Away Team" set of goals set on the right. 
+
+Things I want to be able to change are:
+
+The font colour of each team
+The duration of the match in minutes (I want 2 halves just like in real football)
+The duration of the sensing of a goal being scored, dictated by how long the ultrasonic reads a value less than the expected 150mm
+The threshold for the ultrasonic sensor (150mm within a range)
+
+
+Hardware/electronic connections
+
+2.8" TFT Screen : ESP32 
+
+GND:GND
+VCC:3.3V
+CLK:D18
+MOSI:D23
+RES:D26
+DC:D27
+BLK:3.3V
+MISO:D19
+
+
+"Home Team" Ultrasonic Sensor (left hand side of the scoreboard) HC-SR04 : ESP32
+
+VCC:3.3V
+GND:GND
+TRIG:D16
+ECHO:D17
+
+
+"Away Team" Ultrasonic Sensor (right hand side of the scoreboard) HC-SR04 : ESP32
+
+VCC:3.3V
+GND:GND
+TRIG:D25
+ECHO:D33
+
+
+Momentary switch for the game clock : ESP32
+
+GND:GND
+pin: D2
+
+
+Can you write some arduino code to implement the above please. Let me know if you have any questions.
+
