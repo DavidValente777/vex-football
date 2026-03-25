@@ -33,6 +33,7 @@ PREGAME ──[BTN1]──> FIRST_HALF ──[clock expires]──> HALFTIME
 | 2.8" ILI9341 TFT LCD | Scoreboard display (320x240, SPI) |
 | 2x VL53L0X | Time-of-flight laser distance sensors (one per goal) |
 | 2x Momentary push buttons | Game control (active LOW, internal pull-up) |
+| 1x Toggle switch | Power on/off (wired to GND, internal pull-up) |
 | Speaker/buzzer | Goal celebration and button feedback (PWM) |
 
 ## Wiring
@@ -75,6 +76,15 @@ PREGAME ──[BTN1]──> FIRST_HALF ──[clock expires]──> HALFTIME
 |--------|-----------|-------|
 | Game control (BTN1) | GPIO 4 | Active LOW, internal pull-up |
 | Goal confirm (BTN2) | GPIO 15 | Active LOW, internal pull-up |
+
+### Power Toggle Switch
+
+| Switch Pin | ESP32 Pin |
+|------------|-----------|
+| One leg | GPIO 33 |
+| Other leg | GND |
+
+When the switch is ON (closed), GPIO 33 is pulled to GND (LOW) and the game runs. When OFF (open), the internal pull-up pulls the pin HIGH, the display goes blank, and all game logic stops. Flipping it back ON resets the game to the pregame state.
 
 ### Speaker
 

@@ -77,6 +77,9 @@
 // Confirm/resume button after a goal (active LOW with internal pull-up)
 #define CONFIRM_BUTTON_PIN  15
 
+// Power toggle switch (active LOW = ON, wired to GND, internal pull-up)
+#define POWER_SWITCH_PIN  33
+
 // Speaker pin
 #define SPEAKER_PIN  13
 #define SPEAKER_PWM_CHANNEL  0
@@ -146,6 +149,10 @@ unsigned long lastConfirmPress = 0;
 GameState stateBeforeGoal = STATE_FIRST_HALF;
 // Track elapsed time so the clock pauses during goal confirmation
 unsigned long elapsedBeforeGoal = 0;
+
+// Power switch state tracking
+bool powerOn = false;
+bool lastPowerOn = false;
 
 // Display refresh tracking
 int lastDisplayedHomeScore = -1;
@@ -616,6 +623,9 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(CONFIRM_BUTTON_PIN, INPUT_PULLUP);
 
+  // Power toggle switch (pulled up — LOW when switch is ON, wired to GND)
+  pinMode(POWER_SWITCH_PIN, INPUT_PULLUP);
+
   // Speaker
   ledcSetup(SPEAKER_PWM_CHANNEL, 2000, 8);
   ledcAttachPin(SPEAKER_PIN, SPEAKER_PWM_CHANNEL);
@@ -631,9 +641,19 @@ void setup() {
   tft.fillScreen(ILI9341_BLACK);
   Serial.printf("Display size: %d x %d\n", tft.width(), tft.height());
 
-  drawFullScoreboard();
+  // Read initial power switch state
+  powerOn = (digitalRead(POWER_SWITCH_PIN) == LOW);
+  lastPowerOn = powerOn;
+
+  if (powerOn) {
+    drawFullScoreboard();
+  } else {
+    tft.fillScreen(ILI9341_BLACK);
+  }
+
   Serial.printf("Button pin %d reads: %d\n", BUTTON_PIN, digitalRead(BUTTON_PIN));
   Serial.printf("Confirm pin %d reads: %d\n", CONFIRM_BUTTON_PIN, digitalRead(CONFIRM_BUTTON_PIN));
+  Serial.printf("Power switch pin %d reads: %d\n", POWER_SWITCH_PIN, digitalRead(POWER_SWITCH_PIN));
   Serial.println("Setup complete!");
 }
 
@@ -642,6 +662,37 @@ void setup() {
 // ============================================================
 
 void loop() {
+  // Check power toggle switch
+  powerOn = (digitalRead(POWER_SWITCH_PIN) == LOW);
+
+  if (!powerOn) {
+    if (lastPowerOn) {
+      // Just switched OFF — blank the display
+      tft.fillScreen(ILI9341_BLACK);
+      ledcWriteTone(SPEAKER_PWM_CHANNEL, 0);
+      Serial.println("Power switch OFF");
+      lastPowerOn = false;
+    }
+    delay(100);
+    return;
+  }
+
+  if (!lastPowerOn) {
+    // Just switched ON — reset game and redraw
+    homeScore = 0;
+    awayScore = 0;
+    gameState = STATE_PREGAME;
+    goalFlashing = false;
+    leftSensorTriggered = false;
+    leftGoalCounted = false;
+    rightSensorTriggered = false;
+    rightGoalCounted = false;
+    forceFullRedraw = true;
+    drawFullScoreboard();
+    Serial.println("Power switch ON");
+    lastPowerOn = true;
+  }
+
   checkButton();
 
   // Handle goal flash animation
