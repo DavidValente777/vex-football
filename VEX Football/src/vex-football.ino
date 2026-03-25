@@ -3,28 +3,19 @@
  * ESP32 + 2.8" TFT (ILI9341) + 2x HC-SR04 + Push Button
  *
  * Libraries required:
- *   - TFT_eSPI (configure User_Setup.h or use the provided setup below)
- *
- * TFT_eSPI User_Setup.h overrides (set these in the library's User_Setup.h):
- *   #define ILI9341_DRIVER
- *   #define TFT_MOSI  23
- *   #define TFT_MISO  19
- *   #define TFT_SCLK  18
- *   #define TFT_CS    -1   // Not connected (tie CS low on the display)
- *   #define TFT_DC    27
- *   #define TFT_RST   26
- *   #define SPI_FREQUENCY  40000000
+ *   - Adafruit_GFX
+ *   - Adafruit_ILI9341
  */
 
-#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
 
 // ============================================================
 // =================== CONFIGURABLE SETTINGS ==================
 // ============================================================
 
 // Team colours (16-bit RGB565 format)
-// Use tft.color565(r, g, b) at runtime, or define directly.
-// Default: Home = Green, Away = Blue
 #define HOME_COLOUR_R  0
 #define HOME_COLOUR_G  255
 #define HOME_COLOUR_B  0
@@ -38,15 +29,26 @@
 
 // Ultrasonic goal detection: the ball must be detected (distance < threshold)
 // for at least this many milliseconds continuously to count as a goal.
-#define GOAL_DETECT_DURATION_MS  300
+#define GOAL_DETECT_DURATION_MS  500
 
 // Ultrasonic threshold in mm. If the reading is below this, a ball is present.
-// The empty goal reads ~150mm; a ball inside will read significantly less.
-#define GOAL_THRESHOLD_MM  100
+// Empty goal reads ~105mm (L) and ~99-155mm (R), so 70mm is safely below noise.
+#define GOAL_THRESHOLD_MM  70
+
+// Minimum valid distance in mm. Readings below this are treated as noise.
+#define GOAL_MIN_VALID_MM  10
+
+// Cooldown after a goal before the same sensor can score again (ms)
+#define GOAL_COOLDOWN_MS  3000
 
 // ============================================================
 // ====================== PIN DEFINITIONS =====================
 // ============================================================
+
+// TFT display pins (matching your working legacy wiring)
+#define TFT_CS_PIN   -1
+#define TFT_DC_PIN   27
+#define TFT_RST_PIN  26
 
 // Home ultrasonic sensor (left side of scoreboard)
 #define HOME_TRIG_PIN  16
@@ -57,13 +59,17 @@
 #define AWAY_ECHO_PIN  33
 
 // Push button (active LOW with internal pull-up)
-#define BUTTON_PIN  2
+// Avoid GPIO 2 — it's a boot strapping pin with onboard LED on most ESP32 boards
+#define BUTTON_PIN  4
+
+// Confirm/resume button after a goal (active LOW with internal pull-up)
+#define CONFIRM_BUTTON_PIN  15
 
 // ============================================================
 // ====================== INTERNAL STATE ======================
 // ============================================================
 
-TFT_eSPI tft = TFT_eSPI();
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
 
 uint16_t homeColour;
 uint16_t awayColour;
@@ -74,7 +80,8 @@ enum GameState {
   STATE_FIRST_HALF,   // First half running
   STATE_HALFTIME,     // Halftime — waiting for button press
   STATE_SECOND_HALF,  // Second half running
-  STATE_FULLTIME      // Game over — waiting for button press to reset
+  STATE_FULLTIME,     // Game over — waiting for button press to reset
+  STATE_GOAL_CONFIRM  // Goal scored — waiting for confirm button to resume
 };
 
 GameState gameState = STATE_PREGAME;
@@ -91,11 +98,17 @@ unsigned long elapsedMs = 0;
 // Goal detection state for each sensor
 unsigned long leftSensorBelowSince = 0;
 bool leftSensorTriggered = false;
-bool leftGoalCounted = false;  // Prevents counting the same ball twice
+bool leftGoalCounted = false;
+unsigned long leftGoalTime = 0;
 
 unsigned long rightSensorBelowSince = 0;
 bool rightSensorTriggered = false;
 bool rightGoalCounted = false;
+unsigned long rightGoalTime = 0;
+
+// Sensor debug print throttle
+unsigned long lastSensorPrint = 0;
+#define SENSOR_PRINT_INTERVAL_MS  500
 
 // Goal flash animation
 unsigned long goalFlashStart = 0;
@@ -106,7 +119,13 @@ String goalScorerTeam = "";
 
 // Button debounce
 unsigned long lastButtonPress = 0;
+unsigned long lastConfirmPress = 0;
 #define BUTTON_DEBOUNCE_MS  300
+
+// Track which half to resume after goal confirmation
+GameState stateBeforeGoal = STATE_FIRST_HALF;
+// Track elapsed time so the clock pauses during goal confirmation
+unsigned long elapsedBeforeGoal = 0;
 
 // Display refresh tracking
 int lastDisplayedHomeScore = -1;
@@ -127,11 +146,11 @@ long readDistanceMm(int trigPin, int echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  long duration = pulseIn(echoPin, HIGH, 30000); // timeout ~30ms (~5m max)
+  long duration = pulseIn(echoPin, HIGH, 30000);
   if (duration == 0) {
-    return 9999; // No echo — treat as far away
+    return 9999;
   }
-  long distanceMm = (duration * 343) / 2000; // speed of sound ~343 m/s
+  long distanceMm = (duration * 343) / 2000;
   return distanceMm;
 }
 
@@ -139,17 +158,26 @@ long readDistanceMm(int trigPin, int echoPin) {
 // ===================== DISPLAY HELPERS ======================
 // ============================================================
 
-void drawCenteredText(const char* text, int y, uint16_t colour, int fontSize) {
-  tft.setTextColor(colour, TFT_BLACK);
+// Helper to measure text width (Adafruit_GFX doesn't have textWidth)
+int16_t getTextWidth(const char* text, int fontSize) {
+  int16_t x1, y1;
+  uint16_t w, h;
   tft.setTextSize(fontSize);
-  int16_t textWidth = tft.textWidth(text);
-  int16_t x = (tft.width() - textWidth) / 2;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  return (int16_t)w;
+}
+
+void drawCenteredText(const char* text, int y, uint16_t colour, int fontSize) {
+  tft.setTextColor(colour, ILI9341_BLACK);
+  tft.setTextSize(fontSize);
+  int16_t textW = getTextWidth(text, fontSize);
+  int16_t x = (tft.width() - textW) / 2;
   tft.setCursor(x, y);
   tft.print(text);
 }
 
 void clearLine(int y, int height) {
-  tft.fillRect(0, y, tft.width(), height, TFT_BLACK);
+  tft.fillRect(0, y, tft.width(), height, ILI9341_BLACK);
 }
 
 // ============================================================
@@ -157,24 +185,24 @@ void clearLine(int y, int height) {
 // ============================================================
 
 void drawFullScoreboard() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(ILI9341_BLACK);
 
   // Title bar
-  drawCenteredText("VEX FOOTBALL", 5, TFT_WHITE, 2);
+  drawCenteredText("VEX FOOTBALL", 5, ILI9341_WHITE, 2);
 
   // Draw team names
   tft.setTextSize(2);
-  tft.setTextColor(homeColour, TFT_BLACK);
+  tft.setTextColor(homeColour, ILI9341_BLACK);
   tft.setCursor(10, 40);
   tft.print("Home");
 
-  tft.setTextColor(awayColour, TFT_BLACK);
-  int awayX = tft.width() - 10 - tft.textWidth("Away");
+  tft.setTextColor(awayColour, ILI9341_BLACK);
+  int awayX = tft.width() - 10 - getTextWidth("Away", 2);
   tft.setCursor(awayX, 40);
   tft.print("Away");
 
   // Draw colon between scores
-  drawCenteredText(":", 75, TFT_WHITE, 4);
+  drawCenteredText(":", 75, ILI9341_WHITE, 4);
 
   // Scores
   drawScores();
@@ -196,20 +224,19 @@ void drawScores() {
   // Home score (left side)
   tft.setTextSize(4);
   sprintf(buf, "%d", homeScore);
-  int scoreWidth = tft.textWidth(buf);
-  // Position home score to the left of centre
+  int scoreWidth = getTextWidth(buf, 4);
   int centreX = tft.width() / 2;
   int homeScoreX = centreX - 20 - scoreWidth;
-  tft.fillRect(10, 70, centreX - 20, 35, TFT_BLACK);
-  tft.setTextColor(homeColour, TFT_BLACK);
+  tft.fillRect(10, 70, centreX - 20, 35, ILI9341_BLACK);
+  tft.setTextColor(homeColour, ILI9341_BLACK);
   tft.setCursor(homeScoreX, 75);
   tft.print(buf);
 
   // Away score (right side)
   sprintf(buf, "%d", awayScore);
   int awayScoreX = centreX + 20;
-  tft.fillRect(centreX + 15, 70, centreX - 15, 35, TFT_BLACK);
-  tft.setTextColor(awayColour, TFT_BLACK);
+  tft.fillRect(centreX + 15, 70, centreX - 15, 35, ILI9341_BLACK);
+  tft.setTextColor(awayColour, ILI9341_BLACK);
   tft.setCursor(awayScoreX, 75);
   tft.print(buf);
 
@@ -228,8 +255,14 @@ void drawClock() {
     }
   } else if (gameState == STATE_PREGAME || gameState == STATE_HALFTIME) {
     remaining = halfDurationMs;
+  } else if (gameState == STATE_GOAL_CONFIRM) {
+    // Show the paused clock time
+    if (elapsedBeforeGoal >= halfDurationMs) {
+      remaining = 0;
+    } else {
+      remaining = halfDurationMs - elapsedBeforeGoal;
+    }
   }
-  // At fulltime, remaining = 0
 
   int totalSeconds = remaining / 1000;
   int minutes = totalSeconds / 60;
@@ -239,7 +272,7 @@ void drawClock() {
     char timeBuf[8];
     sprintf(timeBuf, "%02d:%02d", minutes, seconds);
     clearLine(125, 25);
-    drawCenteredText(timeBuf, 125, TFT_YELLOW, 3);
+    drawCenteredText(timeBuf, 125, ILI9341_YELLOW, 3);
     lastDisplayedMinute = minutes;
     lastDisplayedSecond = seconds;
   }
@@ -249,28 +282,37 @@ void drawStateIndicator() {
   clearLine(165, 70);
   switch (gameState) {
     case STATE_PREGAME:
-      drawCenteredText("Press button", 170, TFT_WHITE, 2);
-      drawCenteredText("to start!", 195, TFT_WHITE, 2);
+      drawCenteredText("Press button", 170, ILI9341_WHITE, 2);
+      drawCenteredText("to start!", 195, ILI9341_WHITE, 2);
       break;
     case STATE_FIRST_HALF:
-      drawCenteredText("1st Half", 180, TFT_GREEN, 2);
+      drawCenteredText("1st Half", 180, ILI9341_GREEN, 2);
       break;
     case STATE_HALFTIME:
-      drawCenteredText("HALF TIME", 165, TFT_ORANGE, 2);
-      drawCenteredText("Switch sides!", 190, TFT_RED, 2);
-      drawCenteredText("Press to resume", 215, TFT_WHITE, 1);
+      drawCenteredText("HALF TIME", 165, ILI9341_ORANGE, 2);
+      drawCenteredText("Switch sides!", 190, ILI9341_RED, 2);
+      drawCenteredText("Press to resume", 215, ILI9341_WHITE, 1);
       break;
     case STATE_SECOND_HALF:
-      drawCenteredText("2nd Half", 180, TFT_GREEN, 2);
+      drawCenteredText("2nd Half", 180, ILI9341_GREEN, 2);
       break;
+    case STATE_GOAL_CONFIRM: {
+      uint16_t colour = (goalScorerTeam == "Home") ? homeColour : awayColour;
+      char buf[24];
+      sprintf(buf, "%s scored!", goalScorerTeam.c_str());
+      drawCenteredText(buf, 165, colour, 2);
+      drawCenteredText("Press BTN2", 190, ILI9341_WHITE, 2);
+      drawCenteredText("to resume", 215, ILI9341_WHITE, 2);
+      break;
+    }
     case STATE_FULLTIME:
-      drawCenteredText("FULL TIME!", 170, TFT_RED, 2);
+      drawCenteredText("FULL TIME!", 170, ILI9341_RED, 2);
       if (homeScore > awayScore) {
         drawCenteredText("Home wins!", 195, homeColour, 2);
       } else if (awayScore > homeScore) {
         drawCenteredText("Away wins!", 195, awayColour, 2);
       } else {
-        drawCenteredText("It's a draw!", 195, TFT_WHITE, 2);
+        drawCenteredText("It's a draw!", 195, ILI9341_WHITE, 2);
       }
       break;
   }
@@ -279,27 +321,23 @@ void drawStateIndicator() {
 
 void drawGoalFlash() {
   unsigned long elapsed = millis() - goalFlashStart;
-  // Alternate between showing "GOAL!" and showing the scoreboard
   bool showGoal = ((elapsed / GOAL_FLASH_INTERVAL_MS) % 2) == 0;
 
   if (showGoal) {
     uint16_t colour = (goalScorerTeam == "Home") ? homeColour : awayColour;
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(ILI9341_BLACK);
 
-    // Big "GOAL!" text
     drawCenteredText("GOAL!!!", 50, colour, 4);
 
-    // Show who scored
     char buf[24];
     sprintf(buf, "%s scores!", goalScorerTeam.c_str());
     drawCenteredText(buf, 110, colour, 2);
 
-    // Show updated score
     char scoreBuf[16];
     sprintf(scoreBuf, "%d : %d", homeScore, awayScore);
-    drawCenteredText(scoreBuf, 160, TFT_WHITE, 3);
+    drawCenteredText(scoreBuf, 160, ILI9341_WHITE, 3);
   } else {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(ILI9341_BLACK);
   }
 }
 
@@ -307,15 +345,7 @@ void drawGoalFlash() {
 // ====================== GOAL LOGIC ==========================
 // ============================================================
 
-// Determine which team scores based on which sensor triggered and
-// which half it is (teams switch sides at halftime).
 void processGoal(bool leftSensor) {
-  // First half:  left sensor  = home goal = Away scores
-  //              right sensor = away goal = Home scores
-  // Second half: sides swapped
-  //              left sensor  = away goal = Home scores
-  //              right sensor = home goal = Away scores
-
   bool isFirstHalf = (gameState == STATE_FIRST_HALF);
 
   if (leftSensor) {
@@ -336,6 +366,10 @@ void processGoal(bool leftSensor) {
     }
   }
 
+  // Save current half so we can resume after confirmation
+  stateBeforeGoal = gameState;
+  elapsedBeforeGoal = millis() - halfStartMillis;
+
   goalFlashing = true;
   goalFlashStart = millis();
 }
@@ -347,16 +381,29 @@ void checkGoals() {
 
   unsigned long now = millis();
 
-  // --- Left sensor ---
+  // --- Read both sensors ---
   long leftDist = readDistanceMm(HOME_TRIG_PIN, HOME_ECHO_PIN);
+  long rightDist = readDistanceMm(AWAY_TRIG_PIN, AWAY_ECHO_PIN);
 
-  if (leftDist < GOAL_THRESHOLD_MM) {
+  // --- Debug: print distances periodically ---
+  if (now - lastSensorPrint >= SENSOR_PRINT_INTERVAL_MS) {
+    Serial.printf("L: %ld mm  R: %ld mm\n", leftDist, rightDist);
+    lastSensorPrint = now;
+  }
+
+  // --- Left sensor ---
+  bool leftValid = (leftDist > GOAL_MIN_VALID_MM && leftDist < GOAL_THRESHOLD_MM);
+  bool leftCooldownOk = (now - leftGoalTime > GOAL_COOLDOWN_MS);
+
+  if (leftValid) {
     if (!leftSensorTriggered) {
       leftSensorTriggered = true;
       leftSensorBelowSince = now;
-    } else if (!leftGoalCounted && (now - leftSensorBelowSince >= GOAL_DETECT_DURATION_MS)) {
-      // Ball has been present long enough — count the goal
+    } else if (!leftGoalCounted && leftCooldownOk &&
+               (now - leftSensorBelowSince >= GOAL_DETECT_DURATION_MS)) {
       leftGoalCounted = true;
+      leftGoalTime = now;
+      Serial.printf("GOAL! Left sensor at %ld mm\n", leftDist);
       processGoal(true);
     }
   } else {
@@ -365,14 +412,18 @@ void checkGoals() {
   }
 
   // --- Right sensor ---
-  long rightDist = readDistanceMm(AWAY_TRIG_PIN, AWAY_ECHO_PIN);
+  bool rightValid = (rightDist > GOAL_MIN_VALID_MM && rightDist < GOAL_THRESHOLD_MM);
+  bool rightCooldownOk = (now - rightGoalTime > GOAL_COOLDOWN_MS);
 
-  if (rightDist < GOAL_THRESHOLD_MM) {
+  if (rightValid) {
     if (!rightSensorTriggered) {
       rightSensorTriggered = true;
       rightSensorBelowSince = now;
-    } else if (!rightGoalCounted && (now - rightSensorBelowSince >= GOAL_DETECT_DURATION_MS)) {
+    } else if (!rightGoalCounted && rightCooldownOk &&
+               (now - rightSensorBelowSince >= GOAL_DETECT_DURATION_MS)) {
       rightGoalCounted = true;
+      rightGoalTime = now;
+      Serial.printf("GOAL! Right sensor at %ld mm\n", rightDist);
       processGoal(false);
     }
   } else {
@@ -412,8 +463,8 @@ void checkButton() {
       return;
     }
     lastButtonPress = now;
+    Serial.printf("Button pressed! State: %d\n", gameState);
 
-    // Wait for release (simple debounce)
     while (digitalRead(BUTTON_PIN) == LOW) {
       delay(10);
     }
@@ -432,7 +483,6 @@ void checkButton() {
         break;
 
       case STATE_FULLTIME:
-        // Reset everything
         homeScore = 0;
         awayScore = 0;
         gameState = STATE_PREGAME;
@@ -445,7 +495,6 @@ void checkButton() {
         break;
 
       default:
-        // During play — button does nothing
         break;
     }
   }
@@ -457,6 +506,7 @@ void checkButton() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n\n=== VEX Football Scoreboard ===");
 
   // Ultrasonic pins
   pinMode(HOME_TRIG_PIN, OUTPUT);
@@ -464,19 +514,25 @@ void setup() {
   pinMode(AWAY_TRIG_PIN, OUTPUT);
   pinMode(AWAY_ECHO_PIN, INPUT);
 
-  // Button with internal pull-up
+  // Buttons with internal pull-up
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CONFIRM_BUTTON_PIN, INPUT_PULLUP);
 
   // Compute 16-bit colours
   homeColour = tft.color565(HOME_COLOUR_R, HOME_COLOUR_G, HOME_COLOUR_B);
   awayColour = tft.color565(AWAY_COLOUR_R, AWAY_COLOUR_G, AWAY_COLOUR_B);
 
   // Init display
-  tft.init();
+  Serial.println("Initializing TFT...");
+  tft.begin();
   tft.setRotation(1); // Landscape
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(ILI9341_BLACK);
+  Serial.printf("Display size: %d x %d\n", tft.width(), tft.height());
 
   drawFullScoreboard();
+  Serial.printf("Button pin %d reads: %d\n", BUTTON_PIN, digitalRead(BUTTON_PIN));
+  Serial.printf("Confirm pin %d reads: %d\n", CONFIRM_BUTTON_PIN, digitalRead(CONFIRM_BUTTON_PIN));
+  Serial.println("Setup complete!");
 }
 
 // ============================================================
@@ -490,12 +546,33 @@ void loop() {
   if (goalFlashing) {
     if (millis() - goalFlashStart < GOAL_FLASH_DURATION_MS) {
       drawGoalFlash();
-      delay(50); // Small delay for animation pacing
-      return;    // Skip normal updates during flash
+      delay(50);
+      return;
     } else {
       goalFlashing = false;
+      gameState = STATE_GOAL_CONFIRM;
       forceFullRedraw = true;
     }
+  }
+
+  // Wait for confirm button press after a goal
+  if (gameState == STATE_GOAL_CONFIRM) {
+    if (digitalRead(CONFIRM_BUTTON_PIN) == LOW) {
+      unsigned long now = millis();
+      if (now - lastConfirmPress >= BUTTON_DEBOUNCE_MS) {
+        lastConfirmPress = now;
+        while (digitalRead(CONFIRM_BUTTON_PIN) == LOW) {
+          delay(10);
+        }
+        // Resume the half, adjusting the clock so it continues from where it paused
+        gameState = stateBeforeGoal;
+        halfStartMillis = millis() - elapsedBeforeGoal;
+        forceFullRedraw = true;
+      }
+    }
+    // Don't check goals or clock while waiting for confirmation
+    delay(50);
+    return;
   }
 
   checkGoals();
@@ -511,5 +588,5 @@ void loop() {
     drawClock();
   }
 
-  delay(50); // ~20Hz update rate
+  delay(50);
 }
