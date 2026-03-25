@@ -5,11 +5,14 @@
  * Libraries required:
  *   - Adafruit_GFX
  *   - Adafruit_ILI9341
+ *   - Adafruit_VL53L0X (both goal sensors via I2C)
  */
 
 #include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <Adafruit_VL53L0X.h>
 
 // ============================================================
 // =================== CONFIGURABLE SETTINGS ===============/btw ===
@@ -38,13 +41,13 @@
 // Match duration per half in minutes
 #define HALF_DURATION_MINUTES  5
 
-// Ultrasonic goal detection: the ball must be detected (distance < threshold)
+// Goal detection: the ball must be detected (distance < threshold)
 // for at least this many milliseconds continuously to count as a goal.
-#define GOAL_DETECT_DURATION_MS  500
+#define GOAL_DETECT_DURATION_MS  150
 
-// Ultrasonic threshold in mm. If the reading is below this, a ball is present.
-// Empty goal reads ~105mm (L) and ~99-155mm (R), so 70mm is safely below noise.
-#define GOAL_THRESHOLD_MM  70
+// Goal threshold in mm (both sensors)
+// Empty goals read ~175-180mm. Set below idle but above ball distance.
+#define GOAL_THRESHOLD_MM  160
 
 // Minimum valid distance in mm. Readings below this are treated as noise.
 #define GOAL_MIN_VALID_MM  10
@@ -61,13 +64,11 @@
 #define TFT_DC_PIN   27
 #define TFT_RST_PIN  26
 
-// Home ultrasonic sensor (left side of scoreboard)
-#define HOME_TRIG_PIN  16
-#define HOME_ECHO_PIN  17
-
-// Away ultrasonic sensor (right side of scoreboard)
-#define AWAY_TRIG_PIN  25
-#define AWAY_ECHO_PIN  33
+// VL53L0X time-of-flight sensors on separate I2C buses
+// Left goal:  Wire1 — SDA=32, SCL=25
+// Right goal: Wire  — SDA=21, SCL=22 (ESP32 default)
+#define LEFT_I2C_SDA   32
+#define LEFT_I2C_SCL   25
 
 // Push button (active LOW with internal pull-up)
 // Avoid GPIO 2 — it's a boot strapping pin with onboard LED on most ESP32 boards
@@ -85,6 +86,10 @@
 // ============================================================
 
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
+Adafruit_VL53L0X leftSensor = Adafruit_VL53L0X();
+Adafruit_VL53L0X rightSensor = Adafruit_VL53L0X();
+bool leftSensorReady = false;
+bool rightSensorReady = false;
 
 uint16_t homeColour;
 uint16_t awayColour;
@@ -151,22 +156,16 @@ GameState lastDisplayedState = STATE_PREGAME;
 bool forceFullRedraw = true;
 
 // ============================================================
-// ==================== ULTRASONIC READING ====================
+// =================== VL53L0X READING ========================
 // ============================================================
 
-long readDistanceMm(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-
-  long duration = pulseIn(echoPin, HIGH, 30000);
-  if (duration == 0) {
-    return 9999;
+long readVL53L0X(Adafruit_VL53L0X &sensor) {
+  VL53L0X_RangingMeasurementData_t measure;
+  sensor.rangingTest(&measure, false);
+  if (measure.RangeStatus != 4) {
+    return (long)measure.RangeMilliMeter;
   }
-  long distanceMm = (duration * 343) / 2000;
-  return distanceMm;
+  return 9999; // Out of range
 }
 
 // ============================================================
@@ -428,8 +427,8 @@ void checkGoals() {
   unsigned long now = millis();
 
   // --- Read both sensors ---
-  long leftDist = readDistanceMm(HOME_TRIG_PIN, HOME_ECHO_PIN);
-  long rightDist = readDistanceMm(AWAY_TRIG_PIN, AWAY_ECHO_PIN);
+  long leftDist = leftSensorReady ? readVL53L0X(leftSensor) : 9999;
+  long rightDist = rightSensorReady ? readVL53L0X(rightSensor) : 9999;
 
   // --- Debug: print distances periodically ---
   if (now - lastSensorPrint >= SENSOR_PRINT_INTERVAL_MS) {
@@ -555,11 +554,26 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== VEX Football Scoreboard ===");
 
-  // Ultrasonic pins
-  pinMode(HOME_TRIG_PIN, OUTPUT);
-  pinMode(HOME_ECHO_PIN, INPUT);
-  pinMode(AWAY_TRIG_PIN, OUTPUT);
-  pinMode(AWAY_ECHO_PIN, INPUT);
+  // Init I2C buses for goal sensors
+  Wire.begin(21, 22);                        // Right goal
+  Wire1.begin(LEFT_I2C_SDA, LEFT_I2C_SCL);  // Left goal
+  delay(50);
+
+  // Init right sensor (high speed short range mode)
+  if (rightSensor.begin(0x29, false, &Wire, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
+    rightSensorReady = true;
+    Serial.println("VL53L0X (right goal) OK - high speed mode");
+  } else {
+    Serial.println("ERROR: VL53L0X (right goal) not found!");
+  }
+
+  // Init left sensor (high speed short range mode)
+  if (leftSensor.begin(0x29, false, &Wire1, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
+    leftSensorReady = true;
+    Serial.println("VL53L0X (left goal) OK - high speed mode");
+  } else {
+    Serial.println("ERROR: VL53L0X (left goal) not found!");
+  }
 
   // Buttons with internal pull-up
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -642,5 +656,5 @@ void loop() {
     drawClock();
   }
 
-  delay(50);
+  delay(20);
 }
