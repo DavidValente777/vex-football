@@ -39,7 +39,7 @@
 #define AWAY_COLOUR  COLOUR_BLUE
 
 // Match duration per half in minutes
-#define HALF_DURATION_MINUTES  5
+#define HALF_DURATION_MINUTES  1
 
 // Goal detection: the ball must be detected (distance < threshold)
 // for at least this many milliseconds continuously to count as a goal.
@@ -197,6 +197,38 @@ void playGoalCelebration() {
   playTone(1047, 300); // C6 (long finish)
 }
 
+void playFulltimeFanfare() {
+  // Grand final whistle + victory fanfare
+  // Three short blasts (referee whistle style)
+  playTone(2500, 200);
+  delay(100);
+  playTone(2500, 200);
+  delay(100);
+  playTone(2500, 400);
+  delay(300);
+
+  // Victory fanfare melody
+  playTone(523, 150);  // C5
+  delay(50);
+  playTone(523, 150);  // C5
+  delay(50);
+  playTone(523, 150);  // C5
+  delay(50);
+  playTone(659, 300);  // E5
+  delay(100);
+  playTone(587, 150);  // D5
+  delay(50);
+  playTone(659, 150);  // E5
+  delay(50);
+  playTone(784, 400);  // G5
+  delay(150);
+  playTone(659, 200);  // E5
+  delay(100);
+  playTone(784, 200);  // G5
+  delay(100);
+  playTone(1047, 500); // C6 (big finish)
+}
+
 // ============================================================
 // ===================== DISPLAY HELPERS ======================
 // ============================================================
@@ -348,16 +380,20 @@ void drawStateIndicator() {
       drawCenteredText("to resume", 215, ILI9341_WHITE, 2);
       break;
     }
-    case STATE_FULLTIME:
+    case STATE_FULLTIME: {
       drawCenteredText("FULL TIME!", 170, ILI9341_RED, 2);
+      char winBuf[24];
       if (homeScore > awayScore) {
-        drawCenteredText("Home wins!", 195, homeColour, 2);
+        sprintf(winBuf, "%s wins!", HOME_NAME);
+        drawCenteredText(winBuf, 195, homeColour, 2);
       } else if (awayScore > homeScore) {
-        drawCenteredText("Away wins!", 195, awayColour, 2);
+        sprintf(winBuf, "%s wins!", AWAY_NAME);
+        drawCenteredText(winBuf, 195, awayColour, 2);
       } else {
         drawCenteredText("It's a draw!", 195, ILI9341_WHITE, 2);
       }
       break;
+    }
   }
   lastDisplayedState = gameState;
 }
@@ -492,6 +528,7 @@ void checkClock() {
       gameState = STATE_HALFTIME;
     } else {
       gameState = STATE_FULLTIME;
+      playFulltimeFanfare();
     }
     forceFullRedraw = true;
   }
