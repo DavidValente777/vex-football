@@ -1,0 +1,10 @@
+# PlatformIO build files
+.pio/
+
+# VS Code
+.vscode/browse.vc.db
+.vscode/browse.vc.db-shm
+.vscode/browse.vc.db-wal
+.vscode/ipch/
+.vscode/c_cpp_properties.json
+.vscode/launch.json

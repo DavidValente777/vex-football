@@ -12,17 +12,28 @@
 #include <Adafruit_ILI9341.h>
 
 // ============================================================
-// =================== CONFIGURABLE SETTINGS ==================
+// =================== CONFIGURABLE SETTINGS ===============/btw ===
 // ============================================================
 
-// Team colours (16-bit RGB565 format)
-#define HOME_COLOUR_R  0
-#define HOME_COLOUR_G  255
-#define HOME_COLOUR_B  0
+// Team names
+#define HOME_NAME  "David"
+#define AWAY_NAME  "Ronnie"
 
-#define AWAY_COLOUR_R  0
-#define AWAY_COLOUR_G  120
-#define AWAY_COLOUR_B  255
+// Predefined team colours (RGB565 format)
+// Pick from: RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, PURPLE, PINK, WHITE
+#define COLOUR_RED     0xF800
+#define COLOUR_ORANGE  0xFD20
+#define COLOUR_YELLOW  0xFFE0
+#define COLOUR_GREEN   0x07E0
+#define COLOUR_CYAN    0x07FF
+#define COLOUR_BLUE    0x001F
+#define COLOUR_PURPLE  0x780F
+#define COLOUR_PINK    0xF81F
+#define COLOUR_WHITE   0xFFFF
+
+// Set each team's colour here
+#define HOME_COLOUR  COLOUR_GREEN
+#define AWAY_COLOUR  COLOUR_BLUE
 
 // Match duration per half in minutes
 #define HALF_DURATION_MINUTES  5
@@ -64,6 +75,10 @@
 
 // Confirm/resume button after a goal (active LOW with internal pull-up)
 #define CONFIRM_BUTTON_PIN  15
+
+// Speaker pin
+#define SPEAKER_PIN  13
+#define SPEAKER_PWM_CHANNEL  0
 
 // ============================================================
 // ====================== INTERNAL STATE ======================
@@ -155,6 +170,35 @@ long readDistanceMm(int trigPin, int echoPin) {
 }
 
 // ============================================================
+// ======================== SOUND =============================
+// ============================================================
+
+void playTone(int frequency, int durationMs) {
+  ledcWriteTone(SPEAKER_PWM_CHANNEL, frequency);
+  delay(durationMs);
+  ledcWriteTone(SPEAKER_PWM_CHANNEL, 0);
+}
+
+void playButtonBeep() {
+  playTone(1000, 50);
+}
+
+void playGoalCelebration() {
+  // Ascending celebration melody
+  playTone(523, 100);  // C5
+  delay(30);
+  playTone(659, 100);  // E5
+  delay(30);
+  playTone(784, 100);  // G5
+  delay(30);
+  playTone(1047, 200); // C6
+  delay(50);
+  playTone(784, 100);  // G5
+  delay(30);
+  playTone(1047, 300); // C6 (long finish)
+}
+
+// ============================================================
 // ===================== DISPLAY HELPERS ======================
 // ============================================================
 
@@ -194,12 +238,12 @@ void drawFullScoreboard() {
   tft.setTextSize(2);
   tft.setTextColor(homeColour, ILI9341_BLACK);
   tft.setCursor(10, 40);
-  tft.print("Home");
+  tft.print(HOME_NAME);
 
   tft.setTextColor(awayColour, ILI9341_BLACK);
-  int awayX = tft.width() - 10 - getTextWidth("Away", 2);
+  int awayX = tft.width() - 10 - getTextWidth(AWAY_NAME, 2);
   tft.setCursor(awayX, 40);
-  tft.print("Away");
+  tft.print(AWAY_NAME);
 
   // Draw colon between scores
   drawCenteredText(":", 75, ILI9341_WHITE, 4);
@@ -297,7 +341,7 @@ void drawStateIndicator() {
       drawCenteredText("2nd Half", 180, ILI9341_GREEN, 2);
       break;
     case STATE_GOAL_CONFIRM: {
-      uint16_t colour = (goalScorerTeam == "Home") ? homeColour : awayColour;
+      uint16_t colour = (goalScorerTeam == HOME_NAME) ? homeColour : awayColour;
       char buf[24];
       sprintf(buf, "%s scored!", goalScorerTeam.c_str());
       drawCenteredText(buf, 165, colour, 2);
@@ -324,7 +368,7 @@ void drawGoalFlash() {
   bool showGoal = ((elapsed / GOAL_FLASH_INTERVAL_MS) % 2) == 0;
 
   if (showGoal) {
-    uint16_t colour = (goalScorerTeam == "Home") ? homeColour : awayColour;
+    uint16_t colour = (goalScorerTeam == HOME_NAME) ? homeColour : awayColour;
     tft.fillScreen(ILI9341_BLACK);
 
     drawCenteredText("GOAL!!!", 50, colour, 4);
@@ -351,24 +395,26 @@ void processGoal(bool leftSensor) {
   if (leftSensor) {
     if (isFirstHalf) {
       awayScore++;
-      goalScorerTeam = "Away";
+      goalScorerTeam = AWAY_NAME;
     } else {
       homeScore++;
-      goalScorerTeam = "Home";
+      goalScorerTeam = HOME_NAME;
     }
   } else {
     if (isFirstHalf) {
       homeScore++;
-      goalScorerTeam = "Home";
+      goalScorerTeam = HOME_NAME;
     } else {
       awayScore++;
-      goalScorerTeam = "Away";
+      goalScorerTeam = AWAY_NAME;
     }
   }
 
   // Save current half so we can resume after confirmation
   stateBeforeGoal = gameState;
   elapsedBeforeGoal = millis() - halfStartMillis;
+
+  playGoalCelebration();
 
   goalFlashing = true;
   goalFlashStart = millis();
@@ -464,6 +510,7 @@ void checkButton() {
     }
     lastButtonPress = now;
     Serial.printf("Button pressed! State: %d\n", gameState);
+    playButtonBeep();
 
     while (digitalRead(BUTTON_PIN) == LOW) {
       delay(10);
@@ -518,9 +565,13 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(CONFIRM_BUTTON_PIN, INPUT_PULLUP);
 
-  // Compute 16-bit colours
-  homeColour = tft.color565(HOME_COLOUR_R, HOME_COLOUR_G, HOME_COLOUR_B);
-  awayColour = tft.color565(AWAY_COLOUR_R, AWAY_COLOUR_G, AWAY_COLOUR_B);
+  // Speaker
+  ledcSetup(SPEAKER_PWM_CHANNEL, 2000, 8);
+  ledcAttachPin(SPEAKER_PIN, SPEAKER_PWM_CHANNEL);
+
+  // Set team colours
+  homeColour = HOME_COLOUR;
+  awayColour = AWAY_COLOUR;
 
   // Init display
   Serial.println("Initializing TFT...");
@@ -551,7 +602,9 @@ void loop() {
     } else {
       goalFlashing = false;
       gameState = STATE_GOAL_CONFIRM;
-      forceFullRedraw = true;
+      // Draw the scoreboard immediately with the goal confirm message
+      drawFullScoreboard();
+      Serial.println("Goal confirmed — waiting for BTN2");
     }
   }
 
@@ -561,6 +614,8 @@ void loop() {
       unsigned long now = millis();
       if (now - lastConfirmPress >= BUTTON_DEBOUNCE_MS) {
         lastConfirmPress = now;
+        Serial.println("Confirm button pressed — resuming");
+        playButtonBeep();
         while (digitalRead(CONFIRM_BUTTON_PIN) == LOW) {
           delay(10);
         }
@@ -570,7 +625,6 @@ void loop() {
         forceFullRedraw = true;
       }
     }
-    // Don't check goals or clock while waiting for confirmation
     delay(50);
     return;
   }
