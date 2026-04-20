@@ -39,21 +39,25 @@
 #define AWAY_COLOUR  COLOUR_BLUE
 
 // Match duration per half in minutes
-#define HALF_DURATION_MINUTES  1
+#define HALF_DURATION_MINUTES  3
 
 // Goal detection: the ball must be detected (distance < threshold)
 // for at least this many milliseconds continuously to count as a goal.
 #define GOAL_DETECT_DURATION_MS  150
 
-// Goal threshold in mm (both sensors)
-// Empty goals read ~175-180mm. Set below idle but above ball distance.
-#define GOAL_THRESHOLD_MM  160
+// Goal threshold in mm (per sensor)
+// Set below idle reading but above ball distance.
+#define LEFT_GOAL_THRESHOLD_MM   145
+#define RIGHT_GOAL_THRESHOLD_MM  143
 
 // Minimum valid distance in mm. Readings below this are treated as noise.
 #define GOAL_MIN_VALID_MM  10
 
 // Cooldown after a goal before the same sensor can score again (ms)
-#define GOAL_COOLDOWN_MS  3000
+#define GOAL_COOLDOWN_MS  2000
+
+// Number of sensor readings to average (rolling average for noise smoothing)
+#define SENSOR_AVG_SAMPLES  10
 
 // ============================================================
 // ====================== PIN DEFINITIONS =====================
@@ -76,6 +80,9 @@
 
 // Confirm/resume button after a goal (active LOW with internal pull-up)
 #define CONFIRM_BUTTON_PIN  15
+
+// Stop/pause button (active LOW with internal pull-up)
+#define STOP_BUTTON_PIN  5
 
 // Power toggle switch (active LOW = ON, wired to GND, internal pull-up)
 #define POWER_SWITCH_PIN  33
@@ -104,7 +111,8 @@ enum GameState {
   STATE_HALFTIME,     // Halftime — waiting for button press
   STATE_SECOND_HALF,  // Second half running
   STATE_FULLTIME,     // Game over — waiting for button press to reset
-  STATE_GOAL_CONFIRM  // Goal scored — waiting for confirm button to resume
+  STATE_GOAL_CONFIRM, // Goal scored — waiting for confirm button to resume
+  STATE_PAUSED        // Game paused by stop button
 };
 
 GameState gameState = STATE_PREGAME;
@@ -129,6 +137,24 @@ bool rightSensorTriggered = false;
 bool rightGoalCounted = false;
 unsigned long rightGoalTime = 0;
 
+// Last good sensor readings (for I2C error recovery)
+long lastGoodLeft = 9999;
+long lastGoodRight = 9999;
+
+// Rolling average for sensor smoothing
+long leftSamples[SENSOR_AVG_SAMPLES];
+long rightSamples[SENSOR_AVG_SAMPLES];
+int sampleIndex = 0;
+bool samplesReady = false;
+
+long getAverage(long samples[]) {
+  long sum = 0;
+  for (int i = 0; i < SENSOR_AVG_SAMPLES; i++) {
+    sum += samples[i];
+  }
+  return sum / SENSOR_AVG_SAMPLES;
+}
+
 // Sensor debug print throttle
 unsigned long lastSensorPrint = 0;
 #define SENSOR_PRINT_INTERVAL_MS  500
@@ -143,12 +169,17 @@ String goalScorerTeam = "";
 // Button debounce
 unsigned long lastButtonPress = 0;
 unsigned long lastConfirmPress = 0;
+unsigned long lastStopPress = 0;
 #define BUTTON_DEBOUNCE_MS  300
 
 // Track which half to resume after goal confirmation
 GameState stateBeforeGoal = STATE_FIRST_HALF;
 // Track elapsed time so the clock pauses during goal confirmation
 unsigned long elapsedBeforeGoal = 0;
+
+// Track which half to resume after pause
+GameState stateBeforePause = STATE_FIRST_HALF;
+unsigned long elapsedBeforePause = 0;
 
 // Power switch state tracking
 bool powerOn = false;
@@ -163,16 +194,41 @@ GameState lastDisplayedState = STATE_PREGAME;
 bool forceFullRedraw = true;
 
 // ============================================================
+// ======================= I2C SCANNER ========================
+// ============================================================
+
+void scanI2CBus(const char* label, TwoWire &bus) {
+  Serial.printf("I2C scan on %s:\n", label);
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    bus.beginTransmission(addr);
+    if (bus.endTransmission() == 0) {
+      Serial.printf("  device found at 0x%02X\n", addr);
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("  no devices responded");
+  }
+}
+
+// ============================================================
 // =================== VL53L0X READING ========================
 // ============================================================
 
-long readVL53L0X(Adafruit_VL53L0X &sensor) {
+long readVL53L0X(Adafruit_VL53L0X &sensor, long lastGoodReading) {
   VL53L0X_RangingMeasurementData_t measure;
   sensor.rangingTest(&measure, false);
   if (measure.RangeStatus != 4) {
     return (long)measure.RangeMilliMeter;
   }
-  return 9999; // Out of range
+  // RangeStatus 4 can mean out of range OR I2C error.
+  // If the sensor was previously working (had a valid reading near goal range),
+  // an I2C error likely means the ball is blocking the sensor at very close range.
+  if (lastGoodReading > 0 && lastGoodReading < 300) {
+    return GOAL_MIN_VALID_MM + 1; // Treat as blocked — ball is in the goal
+  }
+  return 9999; // Genuinely out of range
 }
 
 // ============================================================
@@ -344,6 +400,12 @@ void drawClock() {
     } else {
       remaining = halfDurationMs - elapsedBeforeGoal;
     }
+  } else if (gameState == STATE_PAUSED) {
+    if (elapsedBeforePause >= halfDurationMs) {
+      remaining = 0;
+    } else {
+      remaining = halfDurationMs - elapsedBeforePause;
+    }
   }
 
   int totalSeconds = remaining / 1000;
@@ -364,7 +426,7 @@ void drawStateIndicator() {
   clearLine(165, 70);
   switch (gameState) {
     case STATE_PREGAME:
-      drawCenteredText("Press button", 170, ILI9341_WHITE, 2);
+      drawCenteredText("Press START", 170, ILI9341_WHITE, 2);
       drawCenteredText("to start!", 195, ILI9341_WHITE, 2);
       break;
     case STATE_FIRST_HALF:
@@ -373,7 +435,7 @@ void drawStateIndicator() {
     case STATE_HALFTIME:
       drawCenteredText("HALF TIME", 165, ILI9341_ORANGE, 2);
       drawCenteredText("Switch sides!", 190, ILI9341_RED, 2);
-      drawCenteredText("Press to resume", 215, ILI9341_WHITE, 1);
+      drawCenteredText("Press START", 215, ILI9341_WHITE, 1);
       break;
     case STATE_SECOND_HALF:
       drawCenteredText("2nd Half", 180, ILI9341_GREEN, 2);
@@ -383,10 +445,14 @@ void drawStateIndicator() {
       char buf[24];
       sprintf(buf, "%s scored!", goalScorerTeam.c_str());
       drawCenteredText(buf, 165, colour, 2);
-      drawCenteredText("Press BTN2", 190, ILI9341_WHITE, 2);
+      drawCenteredText("Press RESUME", 190, ILI9341_WHITE, 2);
       drawCenteredText("to resume", 215, ILI9341_WHITE, 2);
       break;
     }
+    case STATE_PAUSED:
+      drawCenteredText("PAUSED", 170, ILI9341_ORANGE, 3);
+      drawCenteredText("Press RESUME", 205, ILI9341_WHITE, 2);
+      break;
     case STATE_FULLTIME: {
       drawCenteredText("FULL TIME!", 170, ILI9341_RED, 2);
       char winBuf[24];
@@ -470,17 +536,30 @@ void checkGoals() {
   unsigned long now = millis();
 
   // --- Read both sensors ---
-  long leftDist = leftSensorReady ? readVL53L0X(leftSensor) : 9999;
-  long rightDist = rightSensorReady ? readVL53L0X(rightSensor) : 9999;
+  long leftRaw = leftSensorReady ? readVL53L0X(leftSensor, lastGoodLeft) : 9999;
+  long rightRaw = rightSensorReady ? readVL53L0X(rightSensor, lastGoodRight) : 9999;
+
+  // Track last good readings for I2C error recovery
+  if (leftRaw > GOAL_MIN_VALID_MM + 1) lastGoodLeft = leftRaw;
+  if (rightRaw > GOAL_MIN_VALID_MM + 1) lastGoodRight = rightRaw;
+
+  // --- Rolling average to smooth noise ---
+  leftSamples[sampleIndex] = leftRaw;
+  rightSamples[sampleIndex] = rightRaw;
+  sampleIndex = (sampleIndex + 1) % SENSOR_AVG_SAMPLES;
+  if (sampleIndex == 0) samplesReady = true;
+
+  long leftDist = samplesReady ? getAverage(leftSamples) : leftRaw;
+  long rightDist = samplesReady ? getAverage(rightSamples) : rightRaw;
 
   // --- Debug: print distances periodically ---
   if (now - lastSensorPrint >= SENSOR_PRINT_INTERVAL_MS) {
-    Serial.printf("L: %ld mm  R: %ld mm\n", leftDist, rightDist);
+    Serial.printf("L: %ld (avg %ld) mm  R: %ld (avg %ld) mm\n", leftRaw, leftDist, rightRaw, rightDist);
     lastSensorPrint = now;
   }
 
   // --- Left sensor ---
-  bool leftValid = (leftDist > GOAL_MIN_VALID_MM && leftDist < GOAL_THRESHOLD_MM);
+  bool leftValid = (leftDist > GOAL_MIN_VALID_MM && leftDist < LEFT_GOAL_THRESHOLD_MM);
   bool leftCooldownOk = (now - leftGoalTime > GOAL_COOLDOWN_MS);
 
   if (leftValid) {
@@ -500,7 +579,7 @@ void checkGoals() {
   }
 
   // --- Right sensor ---
-  bool rightValid = (rightDist > GOAL_MIN_VALID_MM && rightDist < GOAL_THRESHOLD_MM);
+  bool rightValid = (rightDist > GOAL_MIN_VALID_MM && rightDist < RIGHT_GOAL_THRESHOLD_MM);
   bool rightCooldownOk = (now - rightGoalTime > GOAL_COOLDOWN_MS);
 
   if (rightValid) {
@@ -603,25 +682,31 @@ void setup() {
   Wire1.begin(LEFT_I2C_SDA, LEFT_I2C_SCL);  // Left goal
   delay(50);
 
-  // Init right sensor (high speed short range mode)
-  if (rightSensor.begin(0x29, false, &Wire, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
-    rightSensorReady = true;
-    Serial.println("VL53L0X (right goal) OK - high speed mode");
-  } else {
-    Serial.println("ERROR: VL53L0X (right goal) not found!");
-  }
+  // Scan both buses so we can see which sensors are actually responding.
+  // VL53L0X default address is 0x29.
+  scanI2CBus("Wire  (right goal, SDA=21, SCL=22)", Wire);
+  scanI2CBus("Wire1 (left goal,  SDA=32, SCL=25)", Wire1);
 
-  // Init left sensor (high speed short range mode)
-  if (leftSensor.begin(0x29, false, &Wire1, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
+  // Init left sensor (default I2C bus)
+  if (leftSensor.begin(0x29, false, &Wire, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
     leftSensorReady = true;
     Serial.println("VL53L0X (left goal) OK - high speed mode");
   } else {
     Serial.println("ERROR: VL53L0X (left goal) not found!");
   }
 
+  // Init right sensor (Wire1 bus)
+  if (rightSensor.begin(0x29, false, &Wire1, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
+    rightSensorReady = true;
+    Serial.println("VL53L0X (right goal) OK - high speed mode");
+  } else {
+    Serial.println("ERROR: VL53L0X (right goal) not found!");
+  }
+
   // Buttons with internal pull-up
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(CONFIRM_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
 
   // Power toggle switch (pulled up — LOW when switch is ON, wired to GND)
   pinMode(POWER_SWITCH_PIN, INPUT_PULLUP);
@@ -653,6 +738,7 @@ void setup() {
 
   Serial.printf("Button pin %d reads: %d\n", BUTTON_PIN, digitalRead(BUTTON_PIN));
   Serial.printf("Confirm pin %d reads: %d\n", CONFIRM_BUTTON_PIN, digitalRead(CONFIRM_BUTTON_PIN));
+  Serial.printf("Stop pin %d reads: %d\n", STOP_BUTTON_PIN, digitalRead(STOP_BUTTON_PIN));
   Serial.printf("Power switch pin %d reads: %d\n", POWER_SWITCH_PIN, digitalRead(POWER_SWITCH_PIN));
   Serial.println("Setup complete!");
 }
@@ -694,6 +780,75 @@ void loop() {
   }
 
   checkButton();
+
+  // Check stop/pause button
+  if (digitalRead(STOP_BUTTON_PIN) == LOW) {
+    unsigned long now = millis();
+    if (now - lastStopPress >= BUTTON_DEBOUNCE_MS) {
+      lastStopPress = now;
+      playButtonBeep();
+
+      // Measure how long the button is held
+      unsigned long pressStart = millis();
+      bool longPress = false;
+      while (digitalRead(STOP_BUTTON_PIN) == LOW) {
+        if (millis() - pressStart >= 5000) {
+          longPress = true;
+          break;
+        }
+        delay(10);
+      }
+
+      if (longPress) {
+        // Long press — restart game
+        homeScore = 0;
+        awayScore = 0;
+        gameState = STATE_PREGAME;
+        goalFlashing = false;
+        leftSensorTriggered = false;
+        leftGoalCounted = false;
+        rightSensorTriggered = false;
+        rightGoalCounted = false;
+        forceFullRedraw = true;
+        playTone(500, 300);
+        Serial.println("Game RESET (long press)");
+        // Wait for button release
+        while (digitalRead(STOP_BUTTON_PIN) == LOW) {
+          delay(10);
+        }
+      } else if (gameState == STATE_FIRST_HALF || gameState == STATE_SECOND_HALF) {
+        // Short press — pause the game
+        stateBeforePause = gameState;
+        elapsedBeforePause = millis() - halfStartMillis;
+        gameState = STATE_PAUSED;
+        forceFullRedraw = true;
+        Serial.println("Game PAUSED");
+      }
+    }
+  }
+
+  // Handle paused state — wait for RESUME button, skip game logic
+  if (gameState == STATE_PAUSED) {
+    if (forceFullRedraw || lastDisplayedState != gameState) {
+      drawFullScoreboard();
+    }
+    if (digitalRead(CONFIRM_BUTTON_PIN) == LOW) {
+      unsigned long now = millis();
+      if (now - lastConfirmPress >= BUTTON_DEBOUNCE_MS) {
+        lastConfirmPress = now;
+        playButtonBeep();
+        while (digitalRead(CONFIRM_BUTTON_PIN) == LOW) {
+          delay(10);
+        }
+        gameState = stateBeforePause;
+        halfStartMillis = millis() - elapsedBeforePause;
+        forceFullRedraw = true;
+        Serial.println("Game RESUMED");
+      }
+    }
+    delay(50);
+    return;
+  }
 
   // Handle goal flash animation
   if (goalFlashing) {
