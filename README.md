@@ -4,9 +4,9 @@ An ESP32-based scoreboard system for a VEX robot football arena. Two VL53L0X tim
 
 ## How It Works
 
-Two VEX robots play football on a small arena. Each goal has a VL53L0X laser distance sensor mounted inside the net. When a ball enters the goal, the sensor reads a shorter distance than the empty-goal baseline (~175-180mm). If the reading stays below the threshold (160mm) for at least 150ms, a goal is counted.
+Two VEX robots play football on a small arena. Each goal has a VL53L0X laser distance sensor mounted inside the net. When a ball enters the goal, the sensor reads a shorter distance than the empty-goal baseline (~175-180mm). If the averaged reading stays below the per-goal threshold (145mm left / 143mm right by default) for at least 150ms, a goal is counted.
 
-A game consists of two halves (default 5 minutes each). Teams swap sides at halftime, and the scoring logic accounts for this automatically. After each goal, the clock pauses and a confirmation button must be pressed to resume play.
+A game consists of two halves (default 3 minutes each). Teams swap sides at halftime, and the scoring logic accounts for this automatically. After each goal, the clock pauses and a confirmation button must be pressed to resume play. A stop button can pause a running half at any time, or long-press it for 5 seconds to reset the game. When the second half expires, the board plays a victory fanfare.
 
 ## Game State Machine
 
@@ -15,15 +15,19 @@ PREGAME ──[BTN1]──> FIRST_HALF ──[clock expires]──> HALFTIME
                         |                               |
                    [goal detected]                   [BTN1]
                         |                               |
-                   GOAL_CONFIRM                    SECOND_HALF ──[clock expires]──> FULLTIME
+                   GOAL_CONFIRM                    SECOND_HALF ──[clock expires]──> FULLTIME (fanfare)
                         |                               |                              |
                    [BTN2 resume]                   [goal detected]                  [BTN1]
                         |                               |                              |
                    (back to half)               GOAL_CONFIRM ──[BTN2]──> (back)    PREGAME
+
+Any running half ──[BTN3 short press]──> PAUSED ──[BTN2 resume]──> (back to half)
+Any state        ──[BTN3 held ≥ 5 s]──> PREGAME (full reset)
 ```
 
 - **BTN1** (GPIO 4): Advances game state (start, resume after halftime, reset after fulltime)
-- **BTN2** (GPIO 15): Confirms a goal and resumes play
+- **BTN2** (GPIO 15): Confirms a goal and resumes play; also resumes from pause
+- **BTN3** (GPIO 5): Short press pauses a running half; hold ≥ 5 s to reset the game to pregame
 
 ## Hardware
 
@@ -32,9 +36,9 @@ PREGAME ──[BTN1]──> FIRST_HALF ──[clock expires]──> HALFTIME
 | ESP32 Dev Module | Main microcontroller |
 | 2.8" ILI9341 TFT LCD | Scoreboard display (320x240, SPI) |
 | 2x VL53L0X | Time-of-flight laser distance sensors (one per goal) |
-| 2x Momentary push buttons | Game control (active LOW, internal pull-up) |
+| 3x Momentary push buttons | Start/advance, goal confirm/resume, stop/pause (active LOW, internal pull-up) |
 | 1x Toggle switch | Power on/off (wired to GND, internal pull-up) |
-| Speaker/buzzer | Goal celebration and button feedback (PWM) |
+| Speaker/buzzer | Button feedback, goal celebration, and fulltime fanfare (PWM) |
 
 ## Wiring
 
@@ -74,8 +78,9 @@ PREGAME ──[BTN1]──> FIRST_HALF ──[clock expires]──> HALFTIME
 
 | Button | ESP32 Pin | Notes |
 |--------|-----------|-------|
-| Game control (BTN1) | GPIO 4 | Active LOW, internal pull-up |
-| Goal confirm (BTN2) | GPIO 15 | Active LOW, internal pull-up |
+| Start / advance (BTN1) | GPIO 4 | Active LOW, internal pull-up |
+| Confirm / resume (BTN2) | GPIO 15 | Active LOW, internal pull-up. Confirms a goal and also resumes from pause. |
+| Stop / pause (BTN3) | GPIO 5 | Active LOW, internal pull-up. Short press pauses a running half; hold ≥ 5 s to reset the game. |
 
 ### Power Toggle Switch
 
@@ -100,10 +105,13 @@ These are defined at the top of `VEX Football/src/vex-football.ino`:
 |-----------|---------|-------------|
 | `HOME_NAME` / `AWAY_NAME` | "David" / "Ronnie" | Team names shown on display |
 | `HOME_COLOUR` / `AWAY_COLOUR` | Green / Blue | Team colours (RGB565 presets available) |
-| `HALF_DURATION_MINUTES` | 5 | Length of each half in minutes |
-| `GOAL_THRESHOLD_MM` | 160 | Distance below which a ball is detected |
+| `HALF_DURATION_MINUTES` | 3 | Length of each half in minutes |
+| `LEFT_GOAL_THRESHOLD_MM` | 145 | Distance below which the left sensor counts a ball |
+| `RIGHT_GOAL_THRESHOLD_MM` | 143 | Distance below which the right sensor counts a ball |
+| `GOAL_MIN_VALID_MM` | 10 | Readings below this are treated as noise |
 | `GOAL_DETECT_DURATION_MS` | 150 | How long the ball must be present to count |
-| `GOAL_COOLDOWN_MS` | 3000 | Cooldown before the same goal can score again |
+| `GOAL_COOLDOWN_MS` | 2000 | Cooldown before the same goal can score again |
+| `SENSOR_AVG_SAMPLES` | 10 | Size of the rolling average used to smooth sensor noise |
 
 ## Building
 
